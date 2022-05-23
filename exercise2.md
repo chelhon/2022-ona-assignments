@@ -94,9 +94,9 @@ fakebook <- graph_from_data_frame(d = edge_list, vertices = node_list, directed 
 fakebook
 ```
 
-    ## IGRAPH 6381c1b UN-- 10 17 -- 
+    ## IGRAPH 23bbb4d UN-- 10 17 -- 
     ## + attr: name (v/c)
-    ## + edges from 6381c1b (vertex names):
+    ## + edges from 23bbb4d (vertex names):
     ##  [1] 1--2 2--A 3--4 3--5 3--B 3--C 3--D 4--C 5--6 5--D 6--B 6--D A--B A--C B--C
     ## [16] B--D C--D
 
