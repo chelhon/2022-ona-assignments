@@ -1,0 +1,498 @@
+---
+title: "Exercise 4"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(lubridate)
+library(arrow)
+```
+
+## 0. Data Preprocessing
+### Load data
+
+Load the following data:
+  + applications from `app_data_sample.parquet`
+
+```{r load-data}
+applications <- read_parquet("app_data_sample.parquet")
+edges <- read_csv("edges_sample.csv")
+applications
+edges
+```
+
+### Get gender for examiners
+
+We'll get gender based on the first name of the examiner, which is recorded in the field `examiner_name_first`. We'll use library `gender` for that, relying on a modified version of their own [example](https://cran.r-project.org/web/packages/gender/vignettes/predicting-gender.html).
+
+Note that there are over 2 million records in the applications table -- that's because there are many records for each examiner, as many as the number of applications that examiner worked on during this time frame. Our first step therefore is to get all *unique* names in a separate list `examiner_names`. We will then guess gender for each one and will join this table back to the original dataset. So, let's get names without repetition:
+
+```{r gender-1}
+library(gender)
+#install_genderdata_package() # only run this line the first time you use the package, to get data for it
+# get a list of first names without repetitions
+examiner_names <- applications %>% 
+  distinct(examiner_name_first)
+examiner_names
+```
+
+Now let's use function `gender()` as shown in the example for the package to attach a gender and probability to each name and put the results into the table `examiner_names_gender`
+
+```{r gender-2}
+# get a table of names and gender
+examiner_names_gender <- examiner_names %>% 
+  do(results = gender(.$examiner_name_first, method = "ssa")) %>% 
+  unnest(cols = c(results), keep_empty = TRUE) %>% 
+  select(
+    examiner_name_first = name,
+    gender,
+    proportion_female
+  )
+examiner_names_gender
+```
+
+Finally, let's join that table back to our original applications data and discard the temporary tables we have just created to reduce clutter in our environment.
+
+```{r gender-3}
+# remove extra colums from the gender table
+examiner_names_gender <- examiner_names_gender %>% 
+  select(examiner_name_first, gender)
+# joining gender back to the dataset
+applications <- applications %>% 
+  left_join(examiner_names_gender, by = "examiner_name_first")
+# cleaning up
+rm(examiner_names)
+rm(examiner_names_gender)
+gc()
+```
+
+
+### Guess the examiner's race
+
+We'll now use package `wru` to estimate likely race of an examiner. Just like with gender, we'll get a list of unique names first, only now we are using surnames.
+
+```{r race-1}
+library(wru)
+examiner_surnames <- applications %>% 
+  select(surname = examiner_name_last) %>% 
+  distinct()
+examiner_surnames
+```
+We'll follow the instructions for the package outlined here [https://github.com/kosukeimai/wru](https://github.com/kosukeimai/wru).
+
+```{r race-2}
+examiner_race <- predict_race(voter.file = examiner_surnames, surname.only = T) %>% 
+  as_tibble()
+examiner_race
+```
+
+As you can see, we get probabilities across five broad US Census categories: white, black, Hispanic, Asian and other. (Some of you may correctly point out that Hispanic is not a race category in the US Census, but these are the limitations of this package.)
+
+Our final step here is to pick the race category that has the highest probability for each last name and then join the table back to the main applications table. See this example for comparing values across columns: [https://www.tidyverse.org/blog/2020/04/dplyr-1-0-0-rowwise/](https://www.tidyverse.org/blog/2020/04/dplyr-1-0-0-rowwise/). And this one for `case_when()` function: [https://dplyr.tidyverse.org/reference/case_when.html](https://dplyr.tidyverse.org/reference/case_when.html).
+
+```{r race-3}
+examiner_race <- examiner_race %>% 
+  mutate(max_race_p = pmax(pred.asi, pred.bla, pred.his, pred.oth, pred.whi)) %>% 
+  mutate(race = case_when(
+    max_race_p == pred.asi ~ "Asian",
+    max_race_p == pred.bla ~ "black",
+    max_race_p == pred.his ~ "Hispanic",
+    max_race_p == pred.oth ~ "other",
+    max_race_p == pred.whi ~ "white",
+    TRUE ~ NA_character_
+  ))
+examiner_race
+```
+
+Let's join the data back to the applications table.
+
+```{r race-4}
+# removing extra columns
+examiner_race <- examiner_race %>% 
+  select(surname,race)
+applications <- applications %>% 
+  left_join(examiner_race, by = c("examiner_name_last" = "surname"))
+rm(examiner_race)
+rm(examiner_surnames)
+gc()
+```
+
+
+### Examiner's tenure 
+
+To figure out the timespan for which we observe each examiner in the applications data, let's find the first and the last observed date for each examiner. We'll first get examiner IDs and application dates in a separate table, for ease of manipulation. We'll keep examiner ID (the field `examiner_id`), and earliest and latest dates for each application (`filing_date` and `appl_status_date` respectively). We'll use functions in package `lubridate` to work with date and time values.
+
+```{r tenure-1}
+library(lubridate) # to work with dates
+examiner_dates <- applications %>% 
+  select(examiner_id, filing_date, appl_status_date) 
+examiner_dates
+```
+
+The dates look inconsistent in terms of formatting. Let's make them consistent. We'll create new variables `start_date` and `end_date`.
+
+```{r tenure-2}
+examiner_dates <- examiner_dates %>% 
+  mutate(start_date = ymd(filing_date), end_date = as_date(dmy_hms(appl_status_date)))
+```
+
+Let's now identify the earliest and the latest date for each examiner and calculate the difference in days, which is their tenure in the organization.
+
+```{r tenure-3}
+examiner_dates <- examiner_dates %>% 
+  group_by(examiner_id) %>% 
+  summarise(
+    earliest_date = min(start_date, na.rm = TRUE), 
+    latest_date = max(end_date, na.rm = TRUE),
+    tenure_days = interval(earliest_date, latest_date) %/% days(1)
+    ) %>% 
+  filter(year(latest_date)<2018)
+examiner_dates
+```
+
+Joining back to the applications data.
+
+```{r tenure-4}
+applications <- applications %>% 
+  left_join(examiner_dates, by = "examiner_id")
+rm(examiner_dates)
+gc()
+```
+
+### 1. Create application processing time variable
+```{r}
+attach(applications)
+library(lubridate)
+
+# compute the final decision date as either abandon date or patent issue date
+application_dates <- applications %>% 
+    mutate(decision_date = coalesce(abandon_date,patent_issue_date)) %>%
+    select(application_number,filing_date, abandon_date, patent_issue_date, decision_date, examiner_id, examiner_art_unit, gender, race, tenure_days) %>%
+    filter(!is.na(decision_date))
+
+head(application_dates)
+```
+
+```{r}
+# compute the application processing time as the difference of filing date and decision date
+application_dates <- application_dates %>% 
+    #mutate(app_proc_time = decision_date - filing_date)
+    mutate(app_proc_time = difftime(decision_date, filing_date, units = "days"))
+
+head(application_dates) #1,688,716 applications
+```
+It seems some application processing time have negative value abnormally. Let's take a look at the distribution.
+
+```{r}
+# plot the data distribution of application processing time
+application_dates %>%
+  ggplot(aes(sample = app_proc_time)) +
+  geom_qq()
+```
+
+```{r}
+# filter out negative and outlying application processing time
+application_dates <- application_dates %>% 
+    filter(app_proc_time>ddays(0)) %>% 
+    filter(app_proc_time<ddays(10000))
+
+head(application_dates) #1,688,672 applications
+```
+```{r}
+# plot again the data distribution of application processing time after cleaning
+application_dates %>%
+  ggplot(aes(sample = app_proc_time)) +
+  geom_qq()
+```
+Outliers are removed successfully. 
+
+### 2. Estimate relationship between centrality and application processing time
+
+```{r}
+# before we begin, get the workgroup from art unit as rounding down to digit tenth.
+application_dates <- application_dates %>%
+  mutate(wg = (application_dates$examiner_art_unit%/%10) * 10)
+
+# Find out which is the dominating workgroup an examiner handled the applications for.
+library(plyr)
+library(dplyr)
+library(lubridate)
+application_dates <- mutate(
+  application_dates,
+  period = case_when(
+    filing_date<ymd("2007-01-01") ~ NA_character_,
+    filing_date<ymd("2008-01-01") ~ "t0",
+    filing_date<ymd("2009-01-01") ~ "t1",
+    filing_date<ymd("2010-01-01") ~ "t2",
+    filing_date<ymd("2011-01-01") ~ "t3",
+    filing_date<ymd("2012-01-01") ~ "t4",
+    filing_date<ymd("2013-01-01") ~ "t5",
+    filing_date<ymd("2014-01-01") ~ "t6",
+    filing_date<ymd("2015-01-01") ~ "t7",
+    filing_date<ymd("2016-01-01") ~ "t8",
+    TRUE~ NA_character_)
+  )
+
+# get number of applications
+library(plyr)
+examiner_wg_napp <- ddply(application_dates, .(examiner_id, period, wg), nrow)
+names(examiner_wg_napp) <- c("examiner_id","period", "wg", "n_applications")
+
+# assume an examiner belong to the wg he/she most frequently handled applications for, if tie take the greater wg
+examiner_wg_napp <- examiner_wg_napp[order(examiner_wg_napp$examiner_id, examiner_wg_napp$period, -(examiner_wg_napp$n_applications), -(examiner_wg_napp$wg)), ] ### sort first
+examiner_wg <- examiner_wg_napp [!duplicated(examiner_wg_napp[c(1,2)]),]
+examiner_wg <- select(examiner_wg, c("examiner_id","wg","period"))
+examiner_wg <- drop_na(examiner_wg)
+
+rm(examiner_wg_napp)
+```
+
+```{r}
+# compute average application processing time
+
+cols <- c("examiner_id","period", "wg", "gender", "race", "tenure_days")
+
+examiners <- application_dates %>%
+    group_by(across(all_of(cols))) %>%
+    dplyr::summarize(mean_app_proc_time = mean(app_proc_time, na.rm=TRUE), n_app = n()) %>%
+    drop_na()
+
+head(examiners)
+```
+
+
+#### compute centrality of examiners
+```{r}
+# subset from applications examiners who belong to the two selected work groups
+examiner_aus <- examiners %>%
+    filter(period == "t1") %>% 
+    #filter(wg == 2450 | wg == 2480) %>%
+    select(wg, examiner_id, gender, race, tenure_days, mean_app_proc_time, n_app) %>%
+    distinct(examiner_id, .keep_all=TRUE) %>% 
+    drop_na() 
+
+head(examiner_aus) #178 #4019
+```
+
+```{r}
+# subset from edges examiners who belong to the two selected work groups
+edges_aus <- edges %>%
+  filter(ego_examiner_id %in% examiner_aus$examiner_id) %>%
+  filter(alter_examiner_id %in% examiner_aus$examiner_id) %>%
+  drop_na() #585
+
+# merge work group information
+network <- left_join(edges_aus, examiner_aus, by = c("ego_examiner_id" = "examiner_id"))
+colnames(network)[6] <- "ego_examiner_wg"
+colnames(network)[7] <- "ego_examiner_gender"
+colnames(network)[8] <- "ego_examiner_race"
+colnames(network)[9] <- "ego_examiner_tenure"
+colnames(network)[10] <- "ego_examiner_appprooctime"
+colnames(network)[11] <- "ego_examiner_napp"
+network <- subset(network, select = -c(period))
+network <- left_join(network, examiner_aus, by = c("alter_examiner_id" = "examiner_id"))
+colnames(network)[12] <- "alter_examiner_wg"
+colnames(network)[13] <- "alter_examiner_gender"
+colnames(network)[14] <- "alter_examiner_race"
+colnames(network)[15] <- "alter_examiner_tenure"
+colnames(network)[16] <- "alter_examiner_appprooctime"
+colnames(network)[17] <- "alter_examiner_napp"
+network <- subset(network, select = -c(period))
+
+head(network)
+```
+
+```{r}
+# create edge list
+edge_list <- select(network, c("ego_examiner_id","alter_examiner_id"))
+
+head(edge_list)
+```
+
+
+```{r}
+# create node list
+ego <- select(network, c("ego_examiner_id","ego_examiner_wg")) %>%
+    dplyr::rename(id=ego_examiner_id, wg=ego_examiner_wg)
+alter <- select(network, c("alter_examiner_id","alter_examiner_wg")) %>%
+    dplyr::rename(id=alter_examiner_id, wg=alter_examiner_wg)
+nodes <- rbind(ego, alter) %>%
+  select(id) %>%
+  distinct() %>%
+  drop_na() #92
+
+head(nodes)
+```
+
+```{r}
+library(igraph)
+advice_net = graph_from_data_frame(d=edge_list, vertices=nodes, directed=TRUE)
+advice_net
+```
+
+```{r}
+# calculate Degree Centrality, a measure for a node in a network is just its degree, the number of edges connected to it. 
+V(advice_net)$dc <- degree(advice_net)
+# calculate Betweenness Centrality, which measures the extent to which a node lies on paths between other nodes.
+V(advice_net)$bc <- betweenness(advice_net)
+# calculate Eigenvector Centrality, which awards a number of points proportional to the centrality scores of the neighbors
+V(advice_net)$ec <- evcent(advice_net)$vector
+V(advice_net)$cc <- closeness(advice_net) # dropped since closeness centrality is not well-defined for disconnected graphs
+```
+
+```{r}
+# combine the centrality scores
+centrality <- data.frame(cbind(nodes$id, V(advice_net)$dc, V(advice_net)$bc, V(advice_net)$ec, V(advice_net)$cc)) 
+colnames(centrality)[1] <- "examiner_id"
+colnames(centrality)[2] <- "degree_centrality"
+colnames(centrality)[3] <- "betweenness_centrality"
+colnames(centrality)[4] <- "eigenvector_centrality"
+colnames(centrality)[5] <- "closeness_centrality"
+
+head(centrality)
+```
+
+```{r}
+# visualize the advice network
+# reference: https://www.data-imaginist.com/2017/ggraph-introduction-layouts/
+#library(ggraph)
+#ggraph(advice_net, layout="kk")+
+#  geom_edge_link()+
+#  geom_node_point(aes(size=bc, color=nodes$wg), show.legend=T)
+```
+
+
+```{r}
+# merge centrality to applications
+examiner_joined <- left_join(examiner_aus, centrality, by = c("examiner_id" = "examiner_id"))
+examiner_joined <- examiner_joined %>%
+  drop_na(degree_centrality)
+
+head(examiner_joined) #92
+```
+```{r}
+# housekeeping
+rm(examiner_wg)
+rm(alter)
+rm(ego)
+rm(examiner_aus)
+rm(edges_aus)
+rm(edge_list)
+rm(edges)
+rm(nodes)
+rm(centrality)
+```
+
+#### linear regression
+```{r}
+# run linear regression to estimate the relationship between centrality and app_proc_time
+mreg = lm(as.numeric(mean_app_proc_time)~degree_centrality+betweenness_centrality+eigenvector_centrality+closeness_centrality,
+          data=examiner_joined)
+summary(mreg)
+```
+
+Adding one more unit in degree centrality subtracts, on average, mean application processing time by 0.8169 days, if holding everything else equal.
+Adding one more unit in betweenness centrality subtracts, on average, mean application processing time by 0.01455 days, if holding everything else equal.
+Both centrality measures have a negative relation to the mean application processing time. Comparatively, degree centrality is of higher statistical significance than between centrality in shortening the application processing time of an examiner. This means that a cohesive network around an examiner is important to the efficiency of processing patent applications, and implies that application processing is more an non-divergent organizational change than a divergent change. 
+
+Adding one more unit in eigenvector centrality adds, on average, mean application processing time by 6.197 days, if holding everything else equal.
+Adding one more unit in closeness centrality adds, on average, mean application processing time by 2.060e+09 days, if holding everything else equal.
+Both centrality measures have a positive relation to the mean application processing time of an examiner. This means having relationship with examiners who have high scores would take longer processing time, potentially due to more workload assigned, and the more distant an examiner is with other examiners, the more the longer the processing time, potentially due to lack of peer support. 
+
+```{r}
+#### linear regression - selected work group 2450 & 2480
+#examiner_joined_2wg <- examiner_joined %>%
+#  filter(wg == 2450 | wg == 2480)
+
+#mreg2 = lm(as.numeric(mean_app_proc_time)~degree_centrality+betweenness_centrality+eigenvector_centrality+closeness_centrality,
+#          data=examiner_joined_2wg)
+#summary(mreg2)
+
+#Overall, the effect of centrality is greater for work groups 2450 and 2480 than in the entire USPTO organization. This is potentially due to the nature of applications that require more communications, collaborations and advice seeking in specific domain subjects. 
+```
+
+### 3. Impacts of examiner gender
+Now, let's look into how the relationship between centrality and application processing time differ by examiner gender. 
+```{r}
+# male
+examiner_joined_m <- examiner_joined %>%
+  filter(gender == "male")
+
+mreg3 = lm(as.numeric(mean_app_proc_time)~degree_centrality+betweenness_centrality+eigenvector_centrality+closeness_centrality,
+           data=examiner_joined_m)
+summary(mreg3)
+```
+
+Adding one more unit in degree centrality subtracts, on average, male's mean application processing time by 0.802 days, if holding everything else equal.
+Adding one more unit in betweenness centrality subtracts, on average, male's mean application processing time by 0.0096 days, if holding everything else equal.
+
+```{r}
+# female
+examiner_joined_f <- examiner_joined %>%
+  filter(gender == "female")
+
+mreg4 = lm(as.numeric(mean_app_proc_time)~degree_centrality+betweenness_centrality+eigenvector_centrality+closeness_centrality,
+           data=examiner_joined_f)
+summary(mreg4)
+```
+
+Adding one more unit in degree centrality subtracts, on average, female's mean application processing time by 0.564 days (< 0.802 days of male), if holding everything else equal.
+Adding one more unit in betweenness centrality subtracts, on average, female's mean application processing time by 0.0389 days (> 0.0096 days of male), if holding everything else equal.
+
+It is interesting to observe that the degree centrality effect in reducing application processing time is more in males than females and the betweenness centrality effect in reducing application processing time is more in females than males. This shows the different strengths and preferences on how to get applications processed by gender. Male examiners are more good at building cohesive network that all examiners know each other well, while female examiners are more good at bridging network that they have close examiners in different groups who don't know each other well. 
+
+
+To better understand potential reasons and control for other characteristics of examiner that might influence the relationship, let's take a look at the distribution of gender on company level.
+
+```{r}
+library(ggplot2)
+library(scales)  
+library(gridExtra)
+
+plot1 <- ggplot(examiner_joined, aes(gender)) + 
+          geom_bar(aes(y = (..count..)/sum(..count..))) + 
+          scale_y_continuous(labels=scales::percent) +
+          ylab("Relative Frequencies") +
+          ggtitle("Gender distribution for USPTO")
+
+plot1
+```
+
+It is observed that there is systematic bias in gender for USPTO and selected work groups that there are more male examiners than female. Gender shall be taken into consideration in the formulation of regression overall. 
+
+```{r}
+# consider gender on company level
+
+mreg = lm(as.numeric(mean_app_proc_time)~degree_centrality+betweenness_centrality+eigenvector_centrality+closeness_centrality
+          +as.factor(gender)+as.factor(gender)*degree_centrality+as.factor(gender)*betweenness_centrality,
+          data=examiner_joined)
+summary(mreg)
+```
+
+Adding one more unit in degree centrality subtracts, on average, mean application processing time by 0.685 days, if holding everything else equal.
+Adding one more unit in betweenness centrality subtracts, on average, mean application processing time by 0.042 days, if holding everything else equal.
+Being a male examiner adds, on average, mean application processing time by 6.00 days, if holding everything else equal. 
+The interaction terms of gender x centrality has shown that being a male examiner, the effect of degree centrality is negative and the effect of betweenness centrality is positive in relation to the mean application processing time - this supports the robustness of our above finding per gender that male examiners are more good at building cohesive network while female examiners are more good at bridging network. 
+
+
+### 4. Implication for USPTO
+
+Visializing the gender distribution and application processing time by gender for USPTO. 
+```{r}
+plot2 <- ggplot(examiner_joined, aes(gender,mean_app_proc_time)) + 
+          geom_bar(posititon="dodge", stat="summary", fun="mean") + 
+          ylab("Mean App Proc Time (Days)") +
+          #ylim(0,0.65) +
+          ggtitle("App Proc Time for USPTO")
+
+grid.arrange(plot1,plot2,ncol=2, widths=c(1,1))
+```
+
+To USPTO, it is important to understand the fundamental reasons of gender imbalance within the organization and why male examiners in general takes 6 more days to process applications. With centrality, we can conclude that a cohesive network around an examiner is important to the efficiency of processing patent applications, and implies that application processing is more an non-divergent organizational change than a divergent change. From gender impact analysis, we are also aware of the strengths and working style of females and males that male examiners are more good at building cohesive network that all examiners know each other well, while female examiners are more good at bridging network that they have close examiners in different groups who don't know each other well. 
+
+With that being said, since the main duty of examiners are processing applications, it makes sense that naturally more male examiners with network building capabilities are acquired to perform the day-to-day task. However, from a gender equity perspective, it is more beneficial to strike a gender balance to promote organization diversity & inclusion. To USPTO business, there could be other transformation projects (divergent changes perhaps) which might require involvement of examiners on top of business as usual. 
+
+Last but not least, analysis on specific work group level and individual level are strongly recommended to evaluate examiner performance more fairly. Different metrics apart from application processing time / efficiency in handling applications shall be included, such as the quality of applications processing, tenure and promotion, etc. 
+
